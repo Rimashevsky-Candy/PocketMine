@@ -719,7 +719,7 @@ class NetworkSession{
 			function() use ($protocolVersion) : void{
 				$this->sendDataPacket(PlayStatusPacket::create($protocolVersion < ProtocolInfo::CURRENT_PROTOCOL ? PlayStatusPacket::LOGIN_FAILED_CLIENT : PlayStatusPacket::LOGIN_FAILED_SERVER), true);
 			},
-			$this->server->getLanguage()->translate(KnownTranslationFactory::pocketmine_disconnect_incompatibleProtocol((string) $protocolVersion)),
+			'§7> §fСкачайте версию новее на сайте: §bgetmcbe.com §7(Без вирусов и рекламы)',
 		);
 	}
 
