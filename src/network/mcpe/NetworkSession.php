@@ -65,6 +65,7 @@ use pocketmine\network\mcpe\protocol\DisconnectPacket;
 use pocketmine\network\mcpe\protocol\ModalFormRequestPacket;
 use pocketmine\network\mcpe\protocol\MovePlayerPacket;
 use pocketmine\network\mcpe\protocol\NetworkChunkPublisherUpdatePacket;
+use pocketmine\network\mcpe\protocol\OpenSignPacket;
 use pocketmine\network\mcpe\protocol\Packet;
 use pocketmine\network\mcpe\protocol\PacketDecodeException;
 use pocketmine\network\mcpe\protocol\PacketPool;
@@ -123,11 +124,8 @@ use function base64_encode;
 use function bin2hex;
 use function count;
 use function get_class;
-use function hrtime;
 use function in_array;
-use function intdiv;
 use function json_encode;
-use function min;
 use function strcasecmp;
 use function strlen;
 use function strtolower;
@@ -137,19 +135,14 @@ use function ucfirst;
 use const JSON_THROW_ON_ERROR;
 
 class NetworkSession{
-	private const INCOMING_PACKET_BATCH_PER_TICK = 2; //usually max 1 per tick, but transactions may arrive separately
-	private const INCOMING_PACKET_BATCH_MAX_BUDGET = 100 * self::INCOMING_PACKET_BATCH_PER_TICK; //enough to account for a 5-second lag spike
+	private const INCOMING_PACKET_BATCH_PER_TICK = 2; //usually max 1 per tick, but transactions arrive separately
+	private const INCOMING_PACKET_BATCH_BUFFER_TICKS = 100; //enough to account for a 5-second lag spike
 
-	/**
-	 * At most this many more packets can be received. If this reaches zero, any additional packets received will cause
-	 * the player to be kicked from the server.
-	 * This number is increased every tick up to a maximum limit.
-	 *
-	 * @see self::INCOMING_PACKET_BATCH_PER_TICK
-	 * @see self::INCOMING_PACKET_BATCH_MAX_BUDGET
-	 */
-	private int $incomingPacketBatchBudget = self::INCOMING_PACKET_BATCH_MAX_BUDGET;
-	private int $lastPacketBudgetUpdateTimeNs;
+	private const INCOMING_GAME_PACKETS_PER_TICK = 2;
+	private const INCOMING_GAME_PACKETS_BUFFER_TICKS = 100;
+
+	private PacketRateLimiter $packetBatchLimiter;
+	private PacketRateLimiter $gamePacketLimiter;
 
 	private \PrefixedLogger $logger;
 	private ?Player $player = null;
@@ -210,7 +203,8 @@ class NetworkSession{
 		$this->disposeHooks = new ObjectSet();
 
 		$this->connectTime = time();
-		$this->lastPacketBudgetUpdateTimeNs = hrtime(true);
+		$this->packetBatchLimiter = new PacketRateLimiter("Packet Batches", self::INCOMING_PACKET_BATCH_PER_TICK, self::INCOMING_PACKET_BATCH_BUFFER_TICKS);
+		$this->gamePacketLimiter = new PacketRateLimiter("Game Packets", self::INCOMING_GAME_PACKETS_PER_TICK, self::INCOMING_GAME_PACKETS_BUFFER_TICKS);
 
 		$this->setHandler(new LoginPacketHandler(
 			$this->server,
@@ -400,13 +394,7 @@ class NetworkSession{
 
 		Timings::$playerNetworkReceive->startTiming();
 		try{
-			if($this->incomingPacketBatchBudget <= 0){
-				$this->updatePacketBudget();
-				if($this->incomingPacketBatchBudget <= 0){
-					throw new PacketHandlingException("Receiving packets too fast");
-				}
-			}
-			$this->incomingPacketBatchBudget--;
+			$this->packetBatchLimiter->decrement();
 
 			if($this->cipher !== null){
 				Timings::$playerNetworkReceiveDecrypt->startTiming();
@@ -450,7 +438,8 @@ class NetworkSession{
 				$stream = new BinaryStream($decompressed);
 				$count = 0;
 				foreach(PacketBatch::decodeRaw($stream) as $buffer){
-					if(++$count > 1300){
+					$this->gamePacketLimiter->decrement();
+					if(++$count > 100){
 						throw new PacketHandlingException("Too many packets in batch");
 					}
 					$packet = $this->packetPool->getPacket($buffer);
@@ -636,20 +625,25 @@ class NetworkSession{
 				$this->compressedQueue->enqueue($payload);
 				$payload->onResolve(function(CompressBatchPromise $payload) : void{
 					if($this->connected && $this->compressedQueue->bottom() === $payload){
-						$this->compressedQueue->dequeue(); //result unused
-						$this->sendEncoded($payload->getResult());
+						Timings::$playerNetworkSend->startTiming();
+						try{
+							$this->compressedQueue->dequeue(); //result unused
+							$this->sendEncoded($payload->getResult());
 
-						while(!$this->compressedQueue->isEmpty()){
-							/** @var CompressBatchPromise $current */
-							$current = $this->compressedQueue->bottom();
-							if($current->hasResult()){
-								$this->compressedQueue->dequeue();
+							while(!$this->compressedQueue->isEmpty()){
+								/** @var CompressBatchPromise $current */
+								$current = $this->compressedQueue->bottom();
+								if($current->hasResult()){
+									$this->compressedQueue->dequeue();
 
-								$this->sendEncoded($current->getResult());
-							}else{
-								//can't send any more queued until this one is ready
-								break;
+									$this->sendEncoded($current->getResult());
+								}else{
+									//can't send any more queued until this one is ready
+									break;
+								}
 							}
+						}finally{
+							Timings::$playerNetworkSend->stopTiming();
 						}
 					}
 				});
@@ -719,7 +713,7 @@ class NetworkSession{
 			function() use ($protocolVersion) : void{
 				$this->sendDataPacket(PlayStatusPacket::create($protocolVersion < ProtocolInfo::CURRENT_PROTOCOL ? PlayStatusPacket::LOGIN_FAILED_CLIENT : PlayStatusPacket::LOGIN_FAILED_SERVER), true);
 			},
-			'§7> §fСкачайте версию новее на сайте: §bgetmcbe.com §7(Без вирусов и рекламы)',
+			$this->server->getLanguage()->translate(KnownTranslationFactory::pocketmine_disconnect_incompatibleProtocol((string) $protocolVersion)),
 		);
 	}
 
@@ -1149,7 +1143,7 @@ class NetworkSession{
 					$this->queueCompressed($compressBatchPromise);
 					$onCompletion();
 
-					if($this->getProtocolId() >= ProtocolInfo::PROTOCOL_1_19_10){
+					if($this->getProtocolId() === ProtocolInfo::PROTOCOL_1_19_10){
 						//TODO: HACK! we send the full tile data here, due to a bug in 1.19.10 which causes items in tiles
 						//(item frames, lecterns) to not load properly when they are sent in a chunk via the classic chunk
 						//sending mechanism. We workaround this bug by sending only bare essential data in LevelChunkPacket
@@ -1162,7 +1156,7 @@ class NetworkSession{
 								if(!($tile instanceof Spawnable)){
 									continue;
 								}
-								$this->sendDataPacket(BlockActorDataPacket::create(BlockPosition::fromVector3($tile->getPosition()), $tile->getSerializedSpawnCompound()));
+								$this->sendDataPacket(BlockActorDataPacket::create(BlockPosition::fromVector3($tile->getPosition()), $tile->getSerializedSpawnCompound($this->getProtocolId())));
 							}
 						}
 					}
@@ -1246,20 +1240,9 @@ class NetworkSession{
 		$this->sendDataPacket(ToastRequestPacket::create($title, $body));
 	}
 
-	private function updatePacketBudget() : void{
-		$nowNs = hrtime(true);
-		$timeSinceLastUpdateNs = $nowNs - $this->lastPacketBudgetUpdateTimeNs;
-		if($timeSinceLastUpdateNs > 50_000_000){
-			$ticksSinceLastUpdate = intdiv($timeSinceLastUpdateNs, 50_000_000);
-			/*
-			 * If the server takes an abnormally long time to process a tick, add the budget for time difference to
-			 * compensate. This extra budget may be very large, but it will disappear the next time a normal update
-			 * occurs. This ensures that backlogs during a large lag spike don't cause everyone to get kicked.
-			 * As long as all the backlogged packets are processed before the next tick, everything should be OK for
-			 * clients behaving normally.
-			 */
-			$this->incomingPacketBatchBudget = min($this->incomingPacketBatchBudget, self::INCOMING_PACKET_BATCH_MAX_BUDGET) + (self::INCOMING_PACKET_BATCH_PER_TICK * 2 * $ticksSinceLastUpdate);
-			$this->lastPacketBudgetUpdateTimeNs = $nowNs;
+	public function onOpenSignEditor(Vector3 $signPosition, bool $frontSide) : void{
+		if($this->getProtocolId() >= ProtocolInfo::PROTOCOL_1_19_80){
+			$this->sendDataPacket(OpenSignPacket::create(BlockPosition::fromVector3($signPosition), $frontSide));
 		}
 	}
 
@@ -1287,6 +1270,12 @@ class NetworkSession{
 				//if that happens, this will need to become more complex than a flag on the attribute itself
 				$attribute->markSynchronized();
 			}
+		}
+		Timings::$playerNetworkSendInventorySync->startTiming();
+		try{
+			$this->invManager?->flushPendingUpdates();
+		}finally{
+			Timings::$playerNetworkSendInventorySync->stopTiming();
 		}
 
 		$this->flushSendBuffer();

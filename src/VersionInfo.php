@@ -30,10 +30,10 @@ use function is_int;
 use function str_repeat;
 
 final class VersionInfo{
-	public const NAME = "PocketMine-MP";
-	public const BASE_VERSION = "4.17.2";
+	public const NAME = "forked PMMP";
+	public const BASE_VERSION = "4.20.2";
 	public const IS_DEVELOPMENT_BUILD = true;
-	public const BUILD_CHANNEL = "alpha";
+	public const BUILD_CHANNEL = "stable";
 
 	private function __construct(){
 		//NOOP

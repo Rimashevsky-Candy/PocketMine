@@ -219,6 +219,7 @@ abstract class BaseInventory implements Inventory{
 			$item = $this->getItem($i);
 			if($item->isNull()){
 				$emptySlots[] = $i;
+				continue;
 			}
 
 			if($slot->canStackWith($item) && $item->getCount() < $item->getMaxStackSize()){
@@ -348,7 +349,7 @@ abstract class BaseInventory implements Inventory{
 			if($invManager === null){
 				continue;
 			}
-			$invManager->syncSlot($this, $index);
+			$invManager->onSlotChange($this, $index);
 		}
 	}
 
